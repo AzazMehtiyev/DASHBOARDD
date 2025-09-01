@@ -1,0 +1,1927 @@
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+ob_start();
+session_start();
+
+if (!isset($_SESSION['is_logged_in']) || $_SESSION['is_logged_in'] !== true) {
+    error_log("dashboard.php: User not logged in. Redirecting to login page.");
+    header("Location: login.php");
+    exit();
+}
+
+$current_username = $_SESSION['username'] ?? 'Bilinməyən';
+$current_role = $_SESSION['role'] ?? 'user';
+
+require_once 'db.php';
+require_once 'activity_logger.php';
+
+
+if (isset($_POST['update_kassa'])) {
+    if ($current_role !== 'root') {
+        header("Location: dashboard.php?error=permission_denied");
+        exit();
+    }
+
+    $new_gelir = floatval(htmlspecialchars($_POST['umumi_gelir'] ?? 0));
+    $new_xerc = floatval(htmlspecialchars($_POST['umumi_xerc'] ?? 0));
+    $new_pul = $new_gelir - $new_xerc;
+
+    if (!is_numeric($new_gelir) || !is_numeric($new_xerc)) {
+        header("Location: dashboard.php?error=invalid_kassa_input");
+        exit();
+    }
+
+    try {
+        $stmt = $db->prepare("UPDATE kassa SET umumi_gelir = ?, umumi_xerc = ?, umumi_pul = ? WHERE id = 1");
+        $stmt->execute([$new_gelir, $new_xerc, $new_pul]);
+
+        log_activity($db, $current_username, 'kassa_updated: gelir=' . $new_gelir . ', xerc=' . $new_xerc . ', pul=' . $new_pul, get_client_ip());
+
+        header("Location: dashboard.php?status=kassa_updated");
+        exit();
+    } catch (PDOException $e) {
+        error_log("Kassa update DB error: " . $e->getMessage());
+        header("Location: dashboard.php?error=db_update_failed");
+        exit();
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['update_kassa']) && isset($_GET['edit'])) {
+    if ($current_role !== 'root') {
+        header("Location: dashboard.php?error=permission_denied_edit_product");
+        exit();
+    }
+
+    $original_code = $_GET['edit'];
+    $new_code = $_POST['code'] ?? '';
+    $name = $_POST['name'] ?? '';
+    $price_buy = $_POST['price_buy'] ?? 0;
+    $price_sell = $_POST['price_sell'] ?? 0;
+    $quantity = $_POST['quantity'] ?? 0;
+
+    if ($new_code !== $original_code) {
+        $stmt_check_code = $db->prepare("SELECT COUNT(*) FROM products WHERE code = ?");
+        $stmt_check_code->execute([$new_code]);
+        if ($stmt_check_code->fetchColumn() > 0) {
+            header("Location: dashboard.php?edit=" . urlencode($original_code) . "&error=duplicate_code");
+            exit();
+        }
+    }
+
+    try {
+        $stmt = $db->prepare("UPDATE products SET code = ?, name = ?, price_buy = ?, price_sell = ?, quantity = ? WHERE code = ?");
+        $stmt->execute([$new_code, $name, $price_buy, $price_sell, $quantity, $original_code]);
+
+        log_activity($db, $current_username, 'product_edited: ' . $original_code . ' -> ' . $new_code . ' (Name: ' . $name . ')', get_client_ip());
+
+        header("Location: dashboard.php?status=product_updated");
+        exit();
+    } catch (PDOException $e) {
+        error_log("Product edit DB error: " . $e->getMessage());
+        header("Location: dashboard.php?edit=" . urlencode($original_code) . "&error=db_update_failed");
+        exit();
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['update_kassa']) && !isset($_GET['edit'])) {
+    if ($current_role !== 'root' && $current_role !== 'admin') {
+        header("Location: dashboard.php?error=permission_denied_add_product");
+        exit();
+    }
+}
+
+
+$total_sales_from_db = $db->query("SELECT IFNULL(SUM(total_price), 0) as total FROM sales")->fetch(PDO::FETCH_ASSOC)['total'];
+
+$total_cost_from_db = $db->query("
+    SELECT IFNULL(SUM(p.price_buy * s.quantity), 0) as total_cost
+    FROM sales s
+    JOIN products p ON s.product_id = p.id
+")->fetch(PDO::FETCH_ASSOC)['total_cost'];
+
+$kassa = $db->query("SELECT * FROM kassa WHERE id = 1")->fetch(PDO::FETCH_ASSOC);
+if (!$kassa) {
+    $db->query("INSERT INTO kassa (id, umumi_pul, umumi_xerc, umumi_gelir) VALUES (1, 0, 0, 0)");
+    $kassa = ['umumi_gelir' => 0, 'umumi_xerc' => 0, 'umumi_pul' => 0];
+}
+
+$product_to_edit = null;
+if (isset($_GET['edit'])) {
+    if ($current_role === 'root') {
+        $code = $_GET['edit'];
+        $stmt = $db->prepare("SELECT * FROM products WHERE code = ?");
+        $stmt->execute([$code]);
+        $product_to_edit = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$product_to_edit) {
+            header("Location: dashboard.php?error=product_not_found");
+            exit();
+        }
+    } else {
+        header("Location: dashboard.php?error=permission_denied_view_edit_form");
+        exit();
+    }
+}
+
+// Profil şəklinin yolunu təyin etmək üçün
+$profile_pic = 'profile_icon.png'; // Default şəkil
+if ($current_username === 'admin') {
+    $profile_pic = 'elmedin.png';
+} elseif ($current_username === 'root') {
+    $profile_pic = 'dark.png';
+}
+?>
+<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="UTF-8" />
+<title>Kassa Paneli</title>
+<link href="https://fonts.googleapis.com/css2?family=Roboto&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+<style>
+/* ... (Mövcud CSS kodlarınız) ... */
+body {
+    font-family: 'Roboto', sans-serif;
+    background-image: url('drrk.png');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+}
+.container {
+    width: 90%;
+    margin: 30px auto 40px;
+    padding: 20px;
+    background: rgba(255,255,255,0.2);
+    box-shadow: 0 8px 32px rgba(31,38,135,0.37);
+    backdrop-filter: blur(10px);
+    border-radius: 15px;
+    border: 1px solid rgba(255,255,255,0.18);
+    color: #222;
+}
+h2,h3 { color: #333; }
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 20px;
+    background: rgba(255,255,255,0.6);
+    border-radius: 8px;
+    overflow: hidden;
+}
+table, th, td { border: 1px solid #ccc; }
+th, td { padding: 10px; text-align: left; }
+th { background: rgba(255,255,255,0.8); }
+form input, #searchInput {
+    padding: 8px;
+    margin: 5px 0;
+    width: 100%;
+    box-sizing: border-box;
+    border-radius: 6px;
+    border: 1px solid #ccc;
+    background: rgba(255,255,255,0.7);
+    color: #222;
+    font-size: 1em;
+}
+form button {
+    padding: 10px;
+    background: #4CAF50;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 1.1em;
+    transition: background-color 0.3s ease;
+}
+form button:hover {
+    background: #45a049;
+}
+a {
+    color: #007BFF;
+    text-decoration: none;
+}
+a:hover {
+    text-decoration: underline;
+}
+
+.top-buttons {
+    float: right;
+    display: flex;
+    gap: 15px;
+    align-items: center;
+    margin-bottom: 15px;
+}
+.report-btn {
+    font-weight: bold;
+    color: #fff;
+    background-color: #ff8c00;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.2);
+    transition: background-color 0.3s ease;
+}
+.report-btn:hover {
+    background-color: #e57f00;
+}
+.mor-btn {
+    font-weight: bold;
+    color: #fff;
+    background-color: #9c27b0;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.2);
+    transition: background-color 0.3s ease;
+}
+.mor-btn:hover {
+    background-color: #7b1fa2;
+}
+
+.nav-button {
+    display: inline-flex;
+    align-items: center;
+    margin-bottom: 15px;
+    padding: 8px 15px;
+    background-color: #007bff;
+    color: white;
+    text-decoration: none;
+    border-radius: 6px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    margin-right: 10px;
+}
+.nav-button:hover {
+    background-color: #0056b3;
+    text-decoration: none;
+}
+.nav-button i {
+    margin-right: 8px;
+    font-size: 16px;
+}
+.activity-log-button {
+    background-color: #28a745;
+}
+.activity-log-button:hover {
+    background-color: #218838;
+}
+.return-button {
+    background-color: #ff8c00;
+}
+.return-button:hover {
+    background-color: #e57f00;
+}
+.nav-buttons-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+.clearfix::after {
+    content: "";
+    clear: both;
+    display: table;
+}
+#searchResults ul {
+    list-style: none;
+    padding-left: 0;
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    background: rgba(255,255,255,0.9);
+    margin-top: 0;
+}
+#searchResults li {
+    padding: 6px;
+    background: #e8e8e8;
+    margin-bottom: 5px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background 0.3s;
+}
+#searchResults li:hover {
+    background: #d0d0d0;
+}
+#cart {
+    margin-top: 20px;
+    border: 1px solid #ccc;
+    padding: 15px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.7);
+    color: #222;
+}
+#cart table {
+    width: 100%;
+    margin-bottom: 10px;
+}
+#cart table th, #cart table td {
+    padding: 8px;
+    border: 1px solid #ccc;
+    text-align: left;
+}
+#totalPrice {
+    font-weight: bold;
+    font-size: 1.2em;
+}
+#changeDue {
+    font-weight: bold;
+    font-size: 1.2em;
+    color: green;
+}
+.kassa-info {
+    margin-bottom: 20px;
+    padding: 15px;
+    background: rgba(255,255,255,0.8);
+    border-radius: 10px;
+}
+.kassa-edit {
+    margin-top: 20px;
+    padding: 15px;
+    background: rgba(255,255,255,0.85);
+    border-radius: 10px;
+    border: 1px solid #bbb;
+}
+.kassa-edit input {
+    width: 100%;
+    padding: 8px;
+    margin-top: 4px;
+    box-sizing: border-box;
+    border-radius: 6px;
+    border: 1px solid #ccc;
+}
+.kassa-edit button {
+    background-color: #007BFF;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 1em;
+}
+.kassa-edit button:hover {
+    background-color: #0056b3;
+}
+.error-message {
+    color: red;
+    background-color: #ffeaea;
+    border: 1px solid red;
+    padding: 10px;
+    border-radius: 5px;
+    margin-bottom: 15px;
+}
+.success-message {
+    color: green;
+    background-color: #e6ffe6;
+    border: 1px solid green;
+    padding: 10px;
+    border-radius: 5px;
+    margin-bottom: 15px;
+}
+.collapsible-container {
+    width: 100%;
+    margin: 20px auto;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 5px;
+    font-family: sans-serif;
+    background: rgba(255,255,255,0.2);
+    box-shadow: 0 8px 32px rgba(31,38,135,0.37);
+    backdrop-filter: blur(10px);
+}
+.collapsible-header {
+    background-color: rgba(255,255,255,0.4);
+    color: #000;
+    cursor: pointer;
+    padding: 18px;
+    width: 100%;
+    border: none;
+    text-align: left;
+    outline: none;
+    font-size: 18px;
+    transition: 0.4s;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-radius: 5px;
+    font-weight: bold;
+}
+.collapsible-header:hover {
+    background-color: rgba(255,255,255,0.6);
+}
+.collapsible-header.active {
+    background-color: rgba(255,255,255,0.8);
+}
+.collapsible-content {
+    padding: 0 18px;
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.5s ease-in-out;
+    background-color: rgba(255,255,255,0.1);
+}
+.collapsible-content.active {
+    max-height: 5000px;
+    padding: 10px 18px;
+    overflow-y: auto;
+}
+.toggle-icon {
+    font-size: 24px;
+}
+.collapsible-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 0;
+    background: none;
+    border-radius: 0;
+    overflow: visible;
+}
+.collapsible-content th,
+.collapsible-content td {
+    border: 1px solid rgba(0,0,0,0.1);
+    background: rgba(255,255,255,0.4);
+    color: #000;
+}
+.collapsible-content th {
+    background: rgba(255,255,255,0.6);
+}
+.collapsible-content td a {
+    color: #007BFF;
+}
+
+/* Yeni əlavə olunan stil dəyişiklikləri */
+.user-profile-dropdown {
+    position: relative;
+    display: inline-block;
+    cursor: pointer;
+    margin-right: 20px;
+}
+.user-info-toggle {
+    display: flex;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    padding: 5px 10px;
+    transition: background 0.3s;
+}
+.user-info-toggle:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+.user-profile-dropdown .profile-pic {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background-color: #eee;
+    overflow: hidden;
+    margin-right: 10px;
+}
+.user-profile-dropdown .profile-pic img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+.user-profile-dropdown .username {
+    font-weight: bold;
+    color: white;
+}
+.user-profile-dropdown .dropdown-arrow {
+    margin-left: 10px;
+    color: white;
+    transition: transform 0.3s;
+}
+.user-profile-dropdown.active .dropdown-arrow {
+    transform: rotate(180deg);
+}
+.dropdown-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    right: 0;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    min-width: 180px;
+    z-index: 100;
+    overflow: hidden;
+    margin-top: 10px;
+    animation: fadeIn 0.3s ease-out;
+}
+.user-profile-dropdown.active .dropdown-menu {
+    display: block;
+}
+.dropdown-item {
+    padding: 12px 15px;
+    display: block;
+    color: #333;
+    text-decoration: none;
+    transition: background-color 0.2s;
+    border-bottom: 1px solid #eee;
+}
+.dropdown-item:last-child {
+    border-bottom: none;
+}
+.dropdown-item:hover {
+    background-color: #f8f9fa;
+}
+.dropdown-item i {
+    margin-right: 10px;
+}
+
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 101;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+}
+.modal-content {
+    background: rgba(255, 255, 255, 0.8);
+    margin: 15% auto;
+    padding: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    width: 80%;
+    max-width: 400px;
+    border-radius: 10px;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+    position: relative;
+    animation: slideIn 0.3s ease-out;
+}
+.close-btn {
+    color: #aaa;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+}
+.close-btn:hover,
+.close-btn:focus {
+    color: black;
+    text-decoration: none;
+    cursor: pointer;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group input {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.5);
+}
+.modal-content button {
+    width: 100%;
+    padding: 10px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+}
+.modal-content button:hover {
+    background-color: #0056b3;
+}
+.message-box {
+    margin-top: 10px;
+    padding: 10px;
+    border-radius: 5px;
+    display: none;
+}
+.message-box.success {
+    background-color: #d4edda;
+    color: #155724;
+}
+.message-box.error {
+    background-color: #f8d7da;
+    color: #721c24;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slideIn {
+    from { transform: translateY(-50px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+
+.barcode-preview {
+    text-align: center;
+    margin-top: 20px;
+}
+.barcode-preview svg {
+    max-width: 100%;
+    height: auto;
+}
+.barcode-print-btn {
+    background-color: #007bff;
+}
+.barcode-print-btn:hover {
+    background-color: #0056b3;
+}
+.barcode-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.barcode-form label {
+    font-weight: bold;
+}
+.tooltip {
+    position: relative;
+    display: inline-block;
+    border-bottom: 1px dotted black; /* Sual işarəsi altında nöqtəli xətt */
+    cursor: help;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    width: 250px;
+    background-color: #555;
+    color: #fff;
+    text-align: center;
+    border-radius: 6px;
+    padding: 5px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%; /* Tooltip yuxarıda görünür */
+    left: 50%;
+    margin-left: -125px;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+.tooltip .tooltiptext::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    margin-left: -5px;
+    border-width: 5px;
+    border-style: solid;
+    border-color: #555 transparent transparent transparent;
+}
+
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
+
+/* YENİ ƏLAVƏ EDİLƏN CSS KODU */
+#barcode_scanner_hidden_input {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+}
+/* Çap üçün xüsusi stillər */
+@media print {
+    body {
+        margin: 0;
+        padding: 0;
+    }
+    .print-area {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        page-break-after: always;
+        padding-top: 10mm;
+    }
+    .print-area .additional-text {
+        font-family: sans-serif;
+        font-size: 24px;
+        font-weight: bold;
+        margin-top: 10px;
+        text-align: center;
+    }
+    .print-area .barcode-svg-container {
+        width: 100%;
+        max-width: 50mm; /* Barkodun enini 50mm olaraq təyin etdik */
+        margin: 0 auto;
+        text-align: center;
+    }
+    .print-area .barcode-svg-container svg {
+        width: 100%;
+        height: auto;
+    }
+    .modal, .top-buttons, .container {
+        display: none;
+    }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+    <h2>Salam, <?=htmlspecialchars($current_username)?>! (Rol: <?=htmlspecialchars($current_role)?>)</h2>
+    <div class="top-buttons">
+        <button id="createBarcodeBtn" class="mor-btn"><i class="fas fa-barcode"></i> Barkod Yarat</button>
+        <button id="saveReportBtn" class="report-btn"><i class="fas fa-save"></i> Hesabatı yaddaşa yaz</button>
+        <div class="user-profile-dropdown">
+            <div class="user-info-toggle">
+                <div class="profile-pic">
+                    <img src="<?= htmlspecialchars($profile_pic) ?>" alt="Profil şəkli">
+                </div>
+                <span class="username"><?php echo htmlspecialchars($_SESSION['username']); ?></span>
+                <i class="fas fa-chevron-down dropdown-arrow"></i>
+            </div>
+            <div class="dropdown-menu">
+                <?php if ($current_role === 'root'): ?>
+                    <div class="dropdown-item switch-account-btn" data-target-account="admin">
+                        <i class="fas fa-exchange-alt"></i> Hesabı Dəyiş (admin)
+                    </div>
+                <?php elseif ($current_role === 'admin'): ?>
+                    <div class="dropdown-item switch-account-btn" data-target-account="root">
+                        <i class="fas fa-exchange-alt"></i> Hesabı Dəyiş (root)
+                    </div>
+                <?php endif; ?>
+                <a href="logout.php" class="dropdown-item">
+                    <i class="fas fa-sign-out-alt"></i> Çıxış
+                </a>
+            </div>
+        </div>
+    </div>
+    <div class="clearfix"></div>
+
+    <div class="nav-buttons-container">
+        <a href="nisye_umumi_mebleg.php" target="_blank" class="nav-button">
+            <i class="fas fa-money-bill-alt"></i> Nisyə/Ümumi Məbləğ
+        </a>
+        <?php if ($current_role === 'root' || $current_role === 'admin'): ?>
+            <a href="activity_log.php" class="nav-button activity-log-button">
+                <i class="fas fa-history"></i> Fəaliyyət Jurnalı
+            </a>
+            <a href="return_product.php" class="nav-button return-button">
+                <i class="fas fa-undo-alt"></i> Məhsul Qaytarma
+            </a>
+        <?php endif; ?>
+    </div>
+    <div class="clearfix"></div>
+
+    <?php if (isset($_GET['error'])): ?>
+        <p class="error-message">Xəta: <?= htmlspecialchars($_GET['error']) ?></p>
+    <?php endif; ?>
+    <?php if (isset($_GET['status']) && $_GET['status'] === 'kassa_updated'): ?>
+        <p class="success-message">Kassa məlumatları uğurla yeniləndi!</p>
+    <?php endif; ?>
+    <?php if (isset($_GET['status']) && $_GET['status'] === 'report_saved'): ?>
+        <p class="success-message">Günün hesabatı uğurla yaddaşa yazıldı!</p>
+    <?php endif; ?>
+
+
+    <div class="kassa-info">
+        <h3>Kassa Məlumatları</h3>
+        <p>Ümumi Gəlir (Satışlardan): <strong><span id="display_umumi_gelir"><?=number_format($kassa['umumi_gelir'] ?? 0, 2)?></span> AZN</strong></p>
+        <p>Ümumi Xərclər: <strong><span id="display_umumi_xerc"><?=number_format($kassa['umumi_xerc'] ?? 0, 2)?></span> AZN</strong></p>
+        <p>Ümumi Pul (Qazanc): <strong><span id="display_umumi_pul"><?=number_format($kassa['umumi_pul'] ?? 0, 2)?></span> AZN</strong></p>
+    </div>
+
+    <?php if ($current_role === 'root'): ?>
+        <div class="kassa-edit">
+            <h3>Kassa Məlumatlarını Redaktə Et</h3>
+            <form method="POST">
+                <label>Ümumi Gəlir:</label><br>
+                <input type="number" step="0.01" name="umumi_gelir" value="<?=htmlspecialchars($kassa['umumi_gelir'])?>" required><br><br>
+                <label>Ümumi Xərclər:</label><br>
+                <input type="number" step="0.01" name="umumi_xerc" value="<?=htmlspecialchars($kassa['umumi_xerc'])?>" required><br><br>
+                <button type="submit" name="update_kassa">Yenilə</button>
+            </form>
+        </div>
+    <?php endif; ?>
+
+<?php if (isset($product_to_edit)): ?>
+    <?php if ($current_role === 'root'): ?>
+        <h3>Məhsulu redaktə et: <?=htmlspecialchars($product_to_edit['name'])?></h3>
+        <form method="POST">
+            <label>Kod:</label>
+            <input name="code" id="edit_product_code_input" value="<?=htmlspecialchars($product_to_edit['code'])?>" required>
+            <button type="button" id="scan_edit_barcode_btn">Tapanca ilə yaz</button><br><br>
+            <label>Ad:</label>
+            <input name="name" value="<?=htmlspecialchars($product_to_edit['name'])?>" required><br><br>
+            <label>Alış qiyməti:</label>
+            <input type="number" step="0.01" name="price_buy" value="<?=htmlspecialchars($product_to_edit['price_buy'])?>" required><br><br>
+            <label>Satış qiyməti:</label>
+            <input type="number" step="0.01" name="price_sell" value="<?=htmlspecialchars($product_to_edit['price_sell'])?>" required><br><br>
+            <label>Say:</label>
+            <input type="number" name="quantity" value="<?=htmlspecialchars($product_to_edit['quantity'])?>" required><br><br>
+            <button type="submit">Yenilə</button>
+            <a href="dashboard.php" style="margin-left:20px;">İmtina et</a>
+        </form>
+        <?php if (isset($_GET['error']) && $_GET['error'] === 'duplicate_code'): ?>
+            <p class="error-message">Xəta: Daxil etdiyiniz kod artıq mövcuddur. Zəhmət olmasa başqa kod seçin.</p>
+        <?php endif; ?>
+    <?php else: ?>
+        <p class="error-message">Bu məhsulu redaktə etmək üçün icazəniz yoxdur.</p>
+    <?php endif; ?>
+<?php else: ?>
+
+    <h3>Məhsul axtar</h3>
+    <input type="text" id="barcode_scanner_hidden_input" style="position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0;" autofocus>
+    <div id="scannedProductInfo" style="margin-bottom: 20px; font-weight: bold; color: #007bff;"></div>
+
+    <input type="text" id="searchInput" placeholder="Ad və ya kod ilə axtar..." autocomplete="off" />
+    <div id="searchResults"></div>
+
+    <hr>
+
+    <h3>Səbət</h3>
+    <div id="cart">
+        <table id="cartTable">
+            <thead>
+                <tr>
+                    <th>Ad</th>
+                    <th>Kod</th>
+                    <th>Qiymət (1 ədəd)</th>
+                    <th>Miqdar</th>
+                    <th>Ümumi</th>
+                    <th>Sil</th>
+                </tr>
+            </thead>
+            <tbody>
+                </tbody>
+        </table>
+        <div>
+            Ümumi məbləğ: <span id="totalPrice">0.00</span> AZN
+        </div>
+        <div style="margin-top:10px;">
+            Müştəridən alınan pul: <input type="number" id="receivedMoney" min="0" step="0.01" />
+        </div>
+        <div>
+            Qaytarılacaq pul: <span id="changeDue">0.00</span> AZN
+        </div>
+        <button id="sellBtn" style="margin-top: 15px; padding: 15px 30px; font-size: 1.2em;">Satışı Tamamla</button>
+    </div>
+
+    <hr>
+
+    <div class="collapsible-container">
+        <button class="collapsible-header">
+            Məhsulların siyahısı:
+            <span class="toggle-icon">+</span>
+        </button>
+        <div class="collapsible-content">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Kod</th>
+                        <th>Ad</th>
+                        <th>Alış Qiyməti</th>
+                        <th>Satış Qiyməti</th>
+                        <th>Say</th>
+                        <?php if ($current_role === 'root'): ?>
+                            <th>Əməliyyatlar</th>
+                        <?php endif; ?>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php
+                $products = $db->query("SELECT id, code, name, price_buy, price_sell, quantity FROM products ORDER BY name ASC")->fetchAll(PDO::FETCH_ASSOC);
+                foreach ($products as &$row) {
+                    $row['id'] = (int)$row['id'];
+                    $row['price_buy'] = (float)$row['price_buy'];
+                    $row['price_sell'] = (float)$row['price_sell'];
+                    $row['quantity'] = (int)$row['quantity'];
+
+                    echo "<tr>
+                                <td>".htmlspecialchars($row['code'])."</td>
+                                <td>".htmlspecialchars($row['name'])."</td>
+                                <td>".number_format($row['price_buy'], 2)."</td>
+                                <td>".number_format($row['price_sell'], 2)."</td>
+                                <td>".htmlspecialchars($row['quantity'])."</td>";
+                    if ($current_role === 'root') {
+                        echo "<td><a href='dashboard.php?edit=".urlencode($row['code'])."'>Redaktə et</a></td>";
+                    }
+                    echo "</tr>";
+                }
+                unset($row);
+                ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <hr>
+
+    <?php if ($current_role === 'root' || $current_role === 'admin'): ?>
+        <h3>Məhsul əlavə et</h3>
+        <form method="POST" action="add_product.php">
+            <label>Kod:</label>
+            <input name="code" id="product_code_input" required>
+            <button type="button" id="scan_barcode_btn">Tapanca ilə yaz</button><br><br>
+            <label>Ad:</label>
+            <input name="name" required><br><br>
+            <label>Alış qiyməti:</label>
+            <input name="price_buy" type="number" step="0.01" required><br><br>
+            <label>Satış qiyməti:</label>
+            <input name="price_sell" type="number" step="0.01" required><br><br>
+            <label>Say:</label>
+            <input name="quantity" type="number" required><br><br>
+            <button type="submit">Əlavə et</button>
+        </form>
+    <?php endif; ?>
+
+<?php endif; ?>
+
+</div>
+
+<div id="barcodeModal" class="modal">
+    <div class="modal-content" style="max-width: 500px;">
+        <span class="close-btn" id="closeBarcodeModal">&times;</span>
+        <h3>Barkod Yarat</h3>
+        <div class="barcode-form">
+            <label for="barcodeText">Barkod Mətni:</label>
+            <input type="text" id="barcodeText" value="123456789012" maxlength="20">
+            
+            <label for="barcodeType">Barkod Növü: 
+                <span class="tooltip"><i class="fas fa-question-circle"></i>
+                    <span class="tooltiptext">
+                        **CODE128:** Ən çox istifadə olunan, hər cür simvol dəstəkləyir.<br>
+                        **EAN13:** Əsasən pərakəndə məhsullar üçün, 13 rəqəmli olmalıdır.<br>
+                        **EAN8:** EAN13-ün qısa versiyası, 8 rəqəmli.<br>
+                        **UPC:** ABŞ və Kanadada istifadə olunur, 12 rəqəmli.
+                    </span>
+                </span>
+            </label>
+            <select id="barcodeType">
+                <option value="CODE128">CODE128 (Məhsullar üçün uyğundur)</option>
+                <option value="EAN13">EAN13 (Əksər mağaza məhsulları)</option>
+                <option value="EAN8">EAN8 (EAN13-ün qısa versiyası)</option>
+                <option value="UPC">UPC (ABŞ/Kanada məhsulları)</option>
+                <option value="ITF14">ITF14 (Qutular üçün)</option>
+            </select>
+            
+            <label for="additionalText">Barkod Altına Yazı (Qalın şriftlə):</label>
+            <input type="text" id="additionalText" placeholder="Məs: Qiymət, Məhsul adı">
+
+            <div class="barcode-preview">
+                <svg id="barcode-canvas"></svg>
+            </div>
+            
+            <button id="printBarcodeBtn" class="barcode-print-btn">
+                <i class="fas fa-print"></i> Yarat və Çap et
+            </button>
+        </div>
+    </div>
+</div>
+
+<div id="change-account-modal" class="modal">
+    <div class="modal-content">
+        <span class="close-btn">&times;</span>
+        <h3>Hesabı Dəyişmək</h3>
+        <p>Hesabı **<span id="target-account-name"></span>** hesabına dəyişmək üçün parolu daxil edin.</p>
+        <form id="change-account-form">
+            <div class="form-group">
+                <input type="password" id="password-input" placeholder="Parolu daxil edin" required>
+            </div>
+            <button type="submit">Dəyişdir</button>
+        </form>
+        <p id="change-account-message" class="message-box"></p>
+    </div>
+</div>
+<script>
+// JavaScript kodunuz eyni qalır
+const searchInput = document.getElementById('searchInput');
+const searchResults = document.getElementById('searchResults');
+const cartTableBody = document.querySelector('#cartTable tbody');
+const totalPriceElem = document.getElementById('totalPrice');
+const receivedMoneyInput = document.getElementById('receivedMoney');
+const changeDueElem = document.getElementById('changeDue');
+const sellBtn = document.getElementById('sellBtn');
+const saveReportBtn = document.getElementById('saveReportBtn');
+const createBarcodeBtn = document.getElementById('createBarcodeBtn');
+const barcodeModal = document.getElementById('barcodeModal');
+const closeBarcodeModalBtn = document.getElementById('closeBarcodeModal');
+const barcodeText = document.getElementById('barcodeText');
+const barcodeType = document.getElementById('barcodeType');
+const additionalText = document.getElementById('additionalText'); // YENİ
+const barcodeCanvas = document.getElementById('barcode-canvas');
+const printBarcodeBtn = document.getElementById('printBarcodeBtn');
+
+
+const barcodeScannerHiddenInput = document.getElementById('barcode_scanner_hidden_input');
+const scannedProductInfo = document.getElementById('scannedProductInfo');
+const productCodeInput = document.getElementById('product_code_input');
+const scanBarcodeBtn = document.getElementById('scan_barcode_btn');
+const editProductCodeInput = document.getElementById('edit_product_code_input');
+const scanEditBarcodeBtn = document.getElementById('scan_edit_barcode_btn');
+
+const cashierName = '<?= htmlspecialchars($current_username) ?>';
+
+
+let cart = [];
+let lastScannedBarcode = '';
+
+const nonScannerInputs = [
+    searchInput,
+    receivedMoneyInput,
+    productCodeInput,
+    editProductCodeInput,
+    document.querySelector('input[name="umumi_gelir"]'),
+    document.querySelector('input[name="umumi_xerc"]'),
+    document.querySelector('input[name="name"]'),
+    document.querySelector('input[name="price_buy"]'),
+    document.querySelector('input[name="price_sell"]'),
+    document.querySelector('input[name="quantity"]'),
+    barcodeText,
+    barcodeType,
+    additionalText
+].filter(Boolean);
+
+
+const userDropdown = document.querySelector('.user-profile-dropdown');
+const switchAccountBtns = document.querySelectorAll('.switch-account-btn');
+const modal = document.getElementById('change-account-modal');
+const closeBtn = document.querySelector('.close-btn');
+const changeAccountForm = document.getElementById('change-account-form');
+const passwordInput = document.getElementById('password-input');
+const messageBox = document.getElementById('change-account-message');
+const targetAccountName = document.getElementById('target-account-name');
+
+function updateBarcode() {
+    try {
+        JsBarcode("#barcode-canvas", barcodeText.value, {
+            format: barcodeType.value,
+            displayValue: true,
+            fontSize: 20, // Şrifti kiçiltmək üçün
+            height: 60,   // Hündürlüyü azaltmaq üçün
+            width: 2,     // Eni azaltmaq üçün
+            lineColor: "#000",
+            margin: 10
+        });
+    } catch (e) {
+        console.error("Barcode yaratma xətası:", e);
+        // Həll yolu: Barkod mətnini rəqəmlərlə əvəz edək
+        let safeValue = barcodeText.value.replace(/[^0-9]/g, '');
+        if(safeValue.length > 0) {
+            JsBarcode("#barcode-canvas", safeValue, {
+                format: "CODE128", // Təhlükəsiz bir növ seçək
+                displayValue: true,
+                fontSize: 20,
+                height: 60,
+                width: 2,
+                lineColor: "#000",
+                margin: 10
+            });
+        }
+    }
+}
+// YENİ FUSKSİYA: EAN-13 növü üçün random barkod yaratma
+function generateEAN13() {
+    let code = '200' + String(Math.floor(Math.random() * 1000000000)).padStart(9, '0');
+    let sum = 0;
+    for (let i = 0; i < 12; i++) {
+        const digit = parseInt(code.charAt(i), 10);
+        if (i % 2 === 0) { // Tək yerlər (0, 2, 4...)
+            sum += digit;
+        } else { // Cüt yerlər (1, 3, 5...)
+            sum += digit * 3;
+        }
+    }
+    const checksum = (10 - (sum % 10)) % 10;
+    return code + checksum;
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    focusBarcodeScanner();
+    renderCart();
+    
+    // Barcode funksiyaları
+    if (createBarcodeBtn) {
+        createBarcodeBtn.addEventListener('click', () => {
+            barcodeModal.style.display = 'block';
+            updateBarcode();
+        });
+    }
+
+    if (closeBarcodeModalBtn) {
+        closeBarcodeModalBtn.addEventListener('click', () => {
+            barcodeModal.style.display = 'none';
+        });
+    }
+
+    if (barcodeText) {
+        barcodeText.addEventListener('input', updateBarcode);
+    }
+    
+    // YENİ: Barkod növü dəyişəndə
+    if (barcodeType) {
+        barcodeType.addEventListener('change', () => {
+            if (barcodeType.value === 'EAN13') {
+                barcodeText.value = generateEAN13();
+            } else {
+                // EAN13 deyil isə, məsələn, "CODE128", hər hansı bir mətn qoya bilərsiniz
+                if (barcodeText.value.length === 13 && barcodeType.value !== 'EAN13') {
+                     barcodeText.value = '';
+                }
+            }
+            updateBarcode();
+        });
+    }
+    // YENİ: Əlavə mətn dəyişəndə preview yenilənmir, sadəcə çapda istifadə olunur
+    if (additionalText) {
+        additionalText.addEventListener('input', () => {
+            // Preview-də göstərmir, amma bu funksiya əlavə oluna bilər
+        });
+    }
+
+    if (printBarcodeBtn) {
+        printBarcodeBtn.addEventListener('click', () => {
+            const barcodeSVG = document.getElementById('barcode-canvas').outerHTML;
+            const textBelowBarcode = additionalText.value.trim(); // YENİ
+            
+            const printWindow = window.open('', '_blank');
+            if (printWindow) {
+                printWindow.document.write(`
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Barkod Çapı</title>
+                        <style>
+                            @page { size: auto; margin: 0; }
+                            body {
+                                margin: 0;
+                                padding: 0;
+                                font-family: sans-serif;
+                            }
+                            .print-area {
+                                width: 100%;
+                                height: 100vh;
+                                display: flex;
+                                flex-direction: column;
+                                align-items: center;
+                                justify-content: center;
+                            }
+                            .print-area .additional-text {
+                                font-family: sans-serif;
+                                font-size: 24px;
+                                font-weight: bold;
+                                margin-top: 10px;
+                                text-align: center;
+                            }
+                            .print-area .barcode-svg-container {
+                                width: 100%;
+                                max-width: 50mm;
+                                margin: 0 auto;
+                                text-align: center;
+                            }
+                            .print-area .barcode-svg-container svg {
+                                width: 100%;
+                                height: auto;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="print-area">
+                            <div class="barcode-svg-container">
+                                ${barcodeSVG}
+                            </div>
+                            ${textBelowBarcode ? `<div class="additional-text">${textBelowBarcode}</div>` : ''}
+                        </div>
+                    </body>
+                    </html>
+                `);
+                printWindow.document.close();
+                printWindow.focus();
+                setTimeout(() => {
+                    printWindow.print();
+                    printWindow.close();
+                }, 200);
+            } else {
+                alert('Brauzer pop-up pəncərələrini bloklayıb. Zəhmət olmasa, pop-up bloklamasını söndürün.');
+            }
+        });
+    }
+    
+    window.addEventListener('click', (event) => {
+        if (event.target == barcodeModal) {
+            barcodeModal.style.display = 'none';
+        }
+    });
+
+    var collapsibleHeader = document.querySelector('.collapsible-header');
+    var collapsibleContent = document.querySelector('.collapsible-content');
+    var toggleIcon = document.querySelector('.toggle-icon');
+
+    collapsibleHeader.addEventListener('click', function() {
+        this.classList.toggle('active');
+        if (collapsibleContent.style.maxHeight) {
+            collapsibleContent.style.maxHeight = null;
+            toggleIcon.textContent = '+';
+        } else {
+            collapsibleContent.style.maxHeight = collapsibleContent.scrollHeight + "px";
+            toggleIcon.textContent = '-';
+        }
+    });
+
+    if (saveReportBtn) {
+        saveReportBtn.addEventListener('click', saveReport);
+    }
+    
+    userDropdown.querySelector('.user-info-toggle').addEventListener('click', function() {
+        userDropdown.classList.toggle('active');
+    });
+
+    window.addEventListener('click', function(event) {
+        if (!userDropdown.contains(event.target)) {
+            userDropdown.classList.remove('active');
+        }
+    });
+
+    switchAccountBtns.forEach(btn => {
+        btn.addEventListener('click', function() {
+            const newUsername = this.dataset.targetAccount;
+            targetAccountName.innerText = newUsername;
+            modal.style.display = 'block';
+            passwordInput.value = '';
+            messageBox.style.display = 'none';
+            setTimeout(() => {
+                passwordInput.focus();
+            }, 50);
+            userDropdown.classList.remove('active');
+        });
+    });
+
+    closeBtn.addEventListener('click', function() {
+        modal.style.display = 'none';
+        messageBox.style.display = 'none';
+        passwordInput.value = '';
+    });
+
+    window.addEventListener('click', function(event) {
+        if (event.target == modal) {
+            modal.style.display = 'none';
+            messageBox.style.display = 'none';
+            passwordInput.value = '';
+        }
+    });
+
+    changeAccountForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+
+        const newUsername = targetAccountName.innerText;
+        const password = passwordInput.value;
+
+        fetch('change_account.php', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ new_username: newUsername, password: password })
+        })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('Şəbəkə xətası.');
+            }
+            return response.json();
+        })
+        .then(data => {
+            messageBox.innerText = data.message;
+            messageBox.style.display = 'block';
+            messageBox.classList.remove('success', 'error');
+
+            if (data.success) {
+                messageBox.classList.add('success');
+                setTimeout(() => {
+                    window.location.href = data.redirect;
+                }, 1500);
+            } else {
+                messageBox.classList.add('error');
+            }
+        })
+        .catch(error => {
+            messageBox.innerText = 'Xəta: ' + error.message;
+            messageBox.style.display = 'block';
+            messageBox.classList.add('error');
+        });
+    });
+});
+
+
+document.addEventListener('blur', function(event) {
+    setTimeout(() => {
+        const activeElement = document.activeElement;
+        const isFocusOnCriticalElement = (
+            nonScannerInputs.includes(activeElement) ||
+            activeElement.tagName === 'BUTTON' ||
+            activeElement.tagName === 'A' ||
+            activeElement.tagName === 'SELECT' ||
+            (searchResults && searchResults.contains(activeElement)) ||
+            (cartTableBody && cartTableBody.contains(activeElement)) ||
+            (modal && modal.contains(activeElement)) ||
+            (barcodeModal && barcodeModal.contains(activeElement))
+        );
+
+        if (barcodeScannerHiddenInput && !isFocusOnCriticalElement) {
+            focusBarcodeScanner();
+        }
+    }, 100);
+}, true);
+
+// YENİLƏNMİŞ `focusBarcodeScanner()` FUNKSİYASI
+function focusBarcodeScanner() {
+    if (barcodeScannerHiddenInput) {
+        // Səhifənin cari scroll mövqeyini yadda saxla
+        const scrollX = window.scrollX || document.documentElement.scrollLeft;
+        const scrollY = window.scrollY || document.documentElement.scrollTop;
+        
+        // Gizli inputa fokuslan, brauzer sürüşməsinin qarşısını alaraq
+        barcodeScannerHiddenInput.focus({preventScroll: true});
+        
+        // Fokuslandıqdan sonra scroll mövqeyini bərpa et
+        window.scrollTo(scrollX, scrollY);
+        
+        barcodeScannerHiddenInput.value = '';
+        scannedProductInfo.textContent = '';
+    }
+}
+
+searchInput.addEventListener('input', () => {
+    const query = searchInput.value.trim();
+    if (query.length === 0) {
+        searchResults.innerHTML = '';
+        return;
+    }
+    if (barcodeScannerHiddenInput) {
+        barcodeScannerHiddenInput.value = '';
+        barcodeScannerHiddenInput.blur();
+        scannedProductInfo.textContent = '';
+    }
+
+    fetch('search_products.php?q=' + encodeURIComponent(query))
+        .then(res => {
+            const contentType = res.headers.get("content-type");
+            if (contentType && contentType.indexOf("application/json") !== -1) {
+                return res.json();
+            } else {
+                return res.text().then(text => {
+                    console.error("JSON parse error: Response is not in JSON format.", text);
+                    throw new Error("Unexpected response format from server.");
+                });
+            }
+        })
+        .then(data => {
+            if (data.error) {
+                console.error("Server search error:", data.error);
+                searchResults.innerHTML = `<p style="color: red;">Xəta: ${data.error}</p>`;
+                return;
+            }
+            if (data.length === 0) {
+                searchResults.innerHTML = '<p>Məhsul tapılmadı.</p>';
+                return;
+            }
+            let html = '<ul>';
+            data.forEach(item => {
+                html += `<li data-id="${item.id}" data-code="${item.code}" data-name="${item.name}" data-price="${item.price_sell}" data-quantity="${item.quantity}">${item.name} (Kod: ${item.code}) - ${item.price_sell} AZN (Stok: ${item.quantity})</li>`;
+            });
+            html += '</ul>';
+            searchResults.innerHTML = html;
+
+            document.querySelectorAll('#searchResults li').forEach(li => {
+                li.addEventListener('click', () => {
+                    addToCart({
+                        id: parseInt(li.dataset.id),
+                        code: li.dataset.code,
+                        name: li.dataset.name,
+                        price_sell: parseFloat(li.dataset.price),
+                        available_quantity: parseInt(li.dataset.quantity)
+                    });
+                    searchResults.innerHTML = '';
+                    searchInput.value = '';
+                    focusBarcodeScanner();
+                });
+            });
+        })
+        .catch(err => {
+            console.error("Search error:", err);
+            scannedProductInfo.textContent = '';
+            searchResults.innerHTML = '<p style="color: red;">Axtarışda şəbəkə/server xətası baş verdi. Zəhmət olmasa, yenidən cəhd edin.</p>';
+        });
+});
+
+if (barcodeScannerHiddenInput) {
+    barcodeScannerHiddenInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+
+            const barcode = barcodeScannerHiddenInput.value.trim();
+            lastScannedBarcode = barcode;
+            barcodeScannerHiddenInput.value = '';
+
+            focusBarcodeScanner();
+
+            if (barcode.length > 0) {
+                fetch('search_products.php?q=' + encodeURIComponent(barcode))
+                    .then(res => {
+                        const contentType = res.headers.get("content-type");
+                        if (contentType && contentType.indexOf("application/json") !== -1) {
+                            return res.json();
+                        } else {
+                            return res.text().then(text => {
+                                console.error("JSON parse error (Barcode): Response is not in JSON format.", text);
+                                throw new Error("Unexpected response format from server (Barcode).");
+                            });
+                        }
+                    })
+                    .then(data => {
+                        if (data.error) {
+                            console.error("Server barcode search error:", data.error);
+                            scannedProductInfo.textContent = `Xəta: ${data.error}`;
+                            return;
+                        }
+                        if (data.length > 0) {
+                            const product = data[0];
+                            addToCart({
+                                id: parseInt(product.id),
+                                code: product.code,
+                                name: product.name,
+                                price_sell: parseFloat(product.price_sell),
+                                available_quantity: parseInt(product.quantity)
+                            });
+                            const existingItemIndex = cart.findIndex(item => item.id === product.id);
+                            if (existingItemIndex !== -1) {
+                                scannedProductInfo.textContent = `${product.name} (${product.code}) sayı artırıldı. Yeni say: ${cart[existingItemIndex].qty}`;
+                            } else {
+                                scannedProductInfo.textContent = `${product.name} (${product.code}) səbətə əlavə edildi.`;
+                            }
+                        } else {
+                            scannedProductInfo.textContent = 'Məhsul tapılmadı.';
+                        }
+                    })
+                    .catch(err => {
+                        console.error("Barcode search error:", err);
+                        scannedProductInfo.textContent = 'Axtarışda xəta baş verdi.';
+                    });
+            }
+        }
+    });
+}
+
+if (scanBarcodeBtn && productCodeInput) {
+    scanBarcodeBtn.addEventListener('click', () => {
+        if (lastScannedBarcode) {
+            productCodeInput.value = lastScannedBarcode;
+            lastScannedBarcode = '';
+            scannedProductInfo.textContent = 'Barkod məhsul koduna yazıldı.';
+        } else {
+            scannedProductInfo.textContent = 'Hələ skan edilmiş barkod yoxdur. Zəhmət olmasa skan edin.';
+            focusBarcodeScanner();
+        }
+    });
+}
+
+if (scanEditBarcodeBtn && editProductCodeInput) {
+    scanEditBarcodeBtn.addEventListener('click', () => {
+        if (lastScannedBarcode) {
+            editProductCodeInput.value = lastScannedBarcode;
+            lastScannedBarcode = '';
+            scannedProductInfo.textContent = 'Barkod redaktə ediləcək məhsul koduna yazıldı.';
+        } else {
+            scannedProductInfo.textContent = 'Hələ skan edilmiş barkod yoxdur. Zəhmət olmasa skan edin.';
+            focusBarcodeScanner();
+        }
+    });
+}
+
+function addToCart(product) {
+    const existingItemIndex = cart.findIndex(item => item.id === product.id);
+    if (existingItemIndex !== -1) {
+        if (cart[existingItemIndex].qty < product.available_quantity) {
+            cart[existingItemIndex].qty++;
+            scannedProductInfo.textContent = `${product.name} (${product.code}) sayı artırıldı. Yeni say: ${cart[existingItemIndex].qty}`;
+        } else {
+            scannedProductInfo.textContent = `${product.name} (${product.code}) stokda kifayət qədər yoxdur. Səbətdəki sayı: ${cart[existingItemIndex].qty}`;
+            return;
+        }
+    } else {
+        if (product.available_quantity > 0) {
+            cart.push({...product, qty: 1});
+            scannedProductInfo.textContent = `${product.name} (${product.code}) səbətə əlavə edildi.`;
+        } else {
+            scannedProductInfo.textContent = `${product.name} (${product.code}) stokda yoxdur.`;
+            return;
+        }
+    }
+    renderCart();
+    focusBarcodeScanner();
+}
+
+function renderCart() {
+    cartTableBody.innerHTML = '';
+    let total = 0;
+    cart.forEach(item => {
+        const subtotal = item.price_sell * item.qty;
+        total += subtotal;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${item.name}</td>
+            <td>${item.code}</td>
+            <td>${item.price_sell.toFixed(2)}</td>
+            <td><input type="number" min="1" max="${item.available_quantity}" value="${item.qty}" style="width: 60px;" data-id="${item.id}"></td>
+            <td>${subtotal.toFixed(2)}</td>
+            <td><button class="remove-item-btn" data-id="${item.id}">Sil</button></td>
+        `;
+        cartTableBody.appendChild(tr);
+    });
+    totalPriceElem.textContent = total.toFixed(2);
+    updateChangeDue();
+    addCartListeners();
+}
+
+function addCartListeners() {
+    cartTableBody.querySelectorAll('input[type="number"]').forEach(input => {
+        input.removeEventListener('change', handleQuantityChange);
+        input.addEventListener('change', handleQuantityChange);
+    });
+
+    cartTableBody.querySelectorAll('.remove-item-btn').forEach(btn => {
+        btn.removeEventListener('click', handleRemoveItem);
+        btn.addEventListener('click', handleRemoveItem);
+    });
+}
+
+function handleQuantityChange() {
+    const id = parseInt(this.dataset.id);
+    const available_quantity = parseInt(this.max);
+    let val = parseInt(this.value);
+
+    if (isNaN(val) || val < 1) {
+        val = 1;
+    }
+    if (val > available_quantity) {
+        alert(`Maksimum ${available_quantity} ədəd daxil edə bilərsiniz.`);
+        val = available_quantity;
+    }
+
+    this.value = val;
+    const item = cart.find(i => i.id === id);
+    if (item) {
+        item.qty = val;
+    }
+    renderCart();
+    focusBarcodeScanner();
+}
+
+function handleRemoveItem() {
+    const id = parseInt(this.dataset.id);
+    if (isNaN(id)) {
+        console.error("Sil düyməsindən alınan ID NaN-dır!");
+        alert("Məhsulun ID-si tapılmadı. Zəhmət olmasa səhifəni yeniləyin.");
+        return;
+    }
+
+    cart = cart.filter(i => i.id !== id);
+    renderCart();
+    focusBarcodeScanner();
+}
+
+receivedMoneyInput.addEventListener('input', updateChangeDue);
+
+function updateChangeDue() {
+    const total = parseFloat(totalPriceElem.textContent);
+    const received = parseFloat(receivedMoneyInput.value) || 0;
+    const change = received - total;
+    changeDueElem.textContent = change.toFixed(2);
+
+    if (change < 0) {
+        changeDueElem.style.color = 'red';
+    } else {
+        changeDueElem.style.color = 'green';
+    }
+}
+
+function generateReceiptCode(length) {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+
+
+function printReceipt(cart, total, received, change, cashier, receiptCode) {
+    const now = new Date();
+    const date = now.toLocaleDateString('az-AZ');
+    const time = now.toLocaleTimeString('az-AZ', { hour: '2-digit', minute: '2-digit' });
+
+    let itemsHtml = '';
+    cart.forEach(item => {
+        const subtotal = (item.qty * item.price_sell).toFixed(2);
+        itemsHtml += `
+            <div class="receipt-item">
+                <span class="item-name">${item.name}</span>
+                <span class="item-total">${subtotal} AZN</span>
+            </div>
+            <span class="item-qty">${item.qty} əd. x ${item.price_sell.toFixed(2)}</span>
+        `;
+    });
+
+    const receiptContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Çek</title>
+            <style>
+                @page {
+                    size: auto;
+                    margin: 0;
+                }
+                body {
+                    width: 57mm;
+                    padding: 5mm 2mm;
+                    margin: 0;
+                    font-family: 'Courier New', Courier, monospace;
+                    font-size: 12px;
+                    line-height: 1.2;
+                    color: black;
+                    box-sizing: border-box;
+                    word-wrap: break-word;
+                    font-weight: bold;
+                }
+                .receipt-container {
+                    page-break-after: avoid !important;
+                }
+                .header, .footer {
+                    text-align: center;
+                    margin: 0 auto;
+                }
+                .logo {
+                    text-align: center;
+                    display: block;
+                    margin-bottom: 5px;
+                    font-size: 1.2em;
+                }
+                .info {
+                    text-align: center;
+                    margin-bottom: 10px;
+                    font-size: 0.9em;
+                }
+                .receipt-item {
+                    display: flex;
+                    justify-content: space-between;
+                    white-space: normal;
+                    margin-bottom: 2px;
+                }
+                .item-name {
+                    word-wrap: break-word;
+                    max-width: 40mm;
+                    flex: 1;
+                }
+                .item-total {
+                    min-width: 15mm;
+                    text-align: right;
+                    flex-shrink: 0;
+                }
+                .item-qty {
+                    display: block;
+                    text-align: left;
+                    font-size: 11px;
+                    margin-left: 5mm;
+                }
+                .divider {
+                    margin: 5px 0;
+                    border-top: 1px dashed black;
+                }
+                .total-line {
+                    display: flex;
+                    justify-content: space-between;
+                    font-weight: bold;
+                    margin-top: 3px;
+                }
+                .total-line.change-line {
+                    margin-top: 10px;
+                }
+                .receipt-code {
+                    text-align: left;
+                    font-size: 12px;
+                    margin-bottom: 5px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="receipt-container">
+                <div class="header">
+                    <pre class="receipt-code">Kod: ${receiptCode}</pre>
+                    <pre class="logo">🛠 095 Auto Hissələr 🛠</pre>
+                    <pre class="info">
+Tarix: ${date}    ${time}
+Kassir: ${cashier}
+                    </pre>
+                </div>
+                <div class="divider"></div>
+                <div class="main-content">
+                    <pre>Məhsullar:</pre>
+                    <div class="divider"></div>
+                    ${itemsHtml}
+                </div>
+                <div class="divider"></div>
+                <div class="total-section">
+                    <div class="total-line">
+                        <span>Cəmi:</span>
+                        <span>${total.toFixed(2)} AZN</span>
+                    </div>
+                    <div class="total-line">
+                        <span>Nağd ödəniş:</span>
+                        <span>${received.toFixed(2)} AZN</span>
+                    </div>
+                    <div class="total-line">
+                        <span>Qalıq:</span>
+                        <span>${change.toFixed(2)} AZN</span>
+                    </div>
+                </div>
+                <div class="divider"></div>
+                <div class="footer">
+                    <pre>
+Bizi Seçdiyiniz Üçün Təşəkkür
+                    Edirik!
+                    </pre>
+                </div>
+            </div>
+        </body>
+        </html>
+    `;
+
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+        alert('Brauzer pop-up pəncərələrini bloklayıb. Zəhmət olmasa, pop-up bloklamasını söndürün.');
+        return;
+    }
+    printWindow.document.write(receiptContent);
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+    printWindow.close();
+
+    window.location.reload();
+}
+
+
+sellBtn.addEventListener('click', () => {
+    if (cart.length === 0) {
+        alert('Səbət boşdur. Zəhmət olmasa məhsul əlavə edin.');
+        return;
+    }
+
+    const total = parseFloat(totalPriceElem.textContent);
+    const received = parseFloat(receivedMoneyInput.value) || 0;
+    const change = received - total;
+
+    if (received < total) {
+        alert('Müştəridən alınan pul ümumi məbləğdən azdır!');
+        return;
+    }
+
+    if (!confirm(`Satışı tamamlamaq istəyirsiniz? Ümumi: ${total.toFixed(2)} AZN, Alınan: ${received.toFixed(2)} AZN, Qaytarılacaq: ${(received - total).toFixed(2)} AZN`)) {
+        return;
+    }
+
+    const receiptCode = generateReceiptCode(6);
+
+    const salePromises = cart.map(item => {
+        const productId = parseInt(item.id);
+        const quantity = parseInt(item.qty);
+        const priceSell = parseFloat(item.price_sell);
+
+        if (isNaN(productId) || isNaN(quantity) || isNaN(priceSell) || productId <= 0 || quantity <= 0 || priceSell <= 0) {
+            console.error(`Invalid data for item: ${item.name}. Product ID: ${item.id}, Quantity: ${item.qty}, Price Sell: ${item.price_sell}`);
+            return Promise.resolve({ success: false, message: `Yanlış məhsul məlumatı (${item.name}). Satış tamamlanmadı.` });
+        }
+
+        const formData = new FormData();
+        formData.append('product_id', productId);
+        formData.append('quantity', quantity);
+        formData.append('price_sell', priceSell);
+        formData.append('receipt_code', receiptCode);
+
+        return fetch('sell.php', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => {
+            const contentType = response.headers.get("content-type");
+            if (contentType && contentType.indexOf("application/json") !== -1) {
+                return response.json();
+            } else {
+                return response.text().then(text => {
+                    console.error("Satış cavabı JSON formatında deyil:", text);
+                    throw new Error("Satış zamanı serverdən gözlənilməyən cavab formatı.");
+                });
+            }
+        })
+        .then(data => {
+            if (!data.success) {
+                console.error(`Satış xətası (${item.name}):`, data.message);
+                alert(`Satış zamanı xəta: ${data.message} (${item.name}). Bəzi məhsullar satılmaya bilər.`);
+            }
+            return data;
+        })
+        .catch(error => {
+            console.error(`Satış API xətası (${item.name}):`, error);
+            alert(`Satış zamanı şəbəkə/server xətası: ${error.message} (${item.name}).`);
+            return { success: false, message: error.message };
+        });
+    });
+
+    Promise.all(salePromises)
+        .then(results => {
+            const allSuccessful = results.every(res => res.success);
+            if (allSuccessful) {
+                printReceipt(cart, total, received, change, cashierName, receiptCode);
+            } else {
+                alert('Bəzi satışlar zamanı problemlər yarandı. Detallar üçün konsola baxın.');
+                setTimeout(() => {
+                    window.location.reload();
+                }, 100);
+            }
+            cart = [];
+            renderCart();
+            receivedMoneyInput.value = '';
+            updateChangeDue();
+        })
+        .catch(error => {
+            console.error("Toplu satış prosesi zamanı xəta:", error);
+            alert("Toplu satış prosesi zamanı gözlənilməz xəta baş verdi.");
+        });
+});
+
+receivedMoneyInput.addEventListener('keypress', function(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        sellBtn.click();
+    }
+});
+
+function saveReport() {
+    console.log("saveReport function called.");
+    
+    const umumiGelir = parseFloat(document.getElementById('display_umumi_gelir').textContent.replace(',', '')) || 0;
+    const umumiXerc = parseFloat(document.getElementById('display_umumi_xerc').textContent.replace(',', '')) || 0;
+    const umumiPul = parseFloat(document.getElementById('display_umumi_pul').textContent.replace(',', '')) || 0;
+
+    if (umumiGelir === 0 && umumiXerc === 0) {
+        alert("Kassa məlumatları boşdur. Hesabat yaddaşa yazıla bilməz.");
+        return;
+    }
+
+    if (!confirm(`Günün hesabatını yaddaşa yazmaq istəyirsiniz? Gəlir: ${umumiGelir.toFixed(2)} AZN, Xərc: ${umumiXerc.toFixed(2)} AZN, Ümumi Pul: ${umumiPul.toFixed(2)} AZN\n\nBu əməliyyatdan sonra kassa məlumatları sıfırlanacaq.`)) {
+        console.log("Report saving cancelled by user.");
+        return;
+    }
+    
+    saveReportBtn.disabled = true;
+    saveReportBtn.innerHTML = 'Gözləyin...';
+
+    fetch('save_report.php', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            umumi_gelir: umumiGelir,
+            umumi_xerc: umumiXerc,
+            umumi_pul: umumiPul
+        })
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Şəbəkə cavabı uğursuz oldu: ' + response.statusText);
+        }
+        return response.json();
+    })
+    .then(data => {
+        saveReportBtn.disabled = false;
+        saveReportBtn.innerHTML = '<i class="fas fa-save"></i> Hesabatı yaddaşa yaz';
+        
+        if (data.success) {
+            alert(data.message);
+            window.location.href = 'dashboard.php?status=report_saved';
+        } else {
+            console.error('Server side error:', data.message);
+            alert('Hesabatın yaddaşa yazılması zamanı xəta baş verdi: ' + data.message);
+        }
+    })
+    .catch(error => {
+        saveReportBtn.disabled = false;
+        saveReportBtn.innerHTML = '<i class="fas fa-save"></i> Hesabatı yaddaşa yaz';
+        console.error('Fetch error:', error);
+        alert('Hesabatın yaddaşa yazılması zamanı şəbəkə xətası baş verdi: ' + error.message);
+    });
+}
+</script>
+</body>
+</html>
+<?php
+ob_end_flush();
+?>
